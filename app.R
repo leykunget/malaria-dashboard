@@ -9,9 +9,19 @@ library(tidyverse)
 library(readr)
 library(plotly)
 library(DT)
+library(sf)           # For spatial features
+library(leaflet)      # For interactive maps
+library(scales)       # For number formatting
+library(RColorBrewer) # For color palettes
 
 # Load regional malaria data
 malaria_final_reg <- read_rds("data/malaria_final_reg.rds")
+merged_data <- read_rds("data/merged_data.rds")  # Load spatial data
+merged_data2023 <- read_rds("data/merged_data2023.rds") # load merged data 2023
+
+# Ensure spatial data is in WGS84 (EPSG:4326) for Leaflet
+merged_data <- st_transform(merged_data, crs = 4326)
+merged_data2023 <- st_transform(merged_data2023, crs = 4326)
 
 # Ensure month is properly ordered as a factor
 if(!is.factor(malaria_final_reg$month)) {
@@ -150,8 +160,13 @@ ui <- page_navbar(
           ),
           helpText("Normalized view shows each region's trends as a percentage of their maximum monthly cases.")
         ),
-        plotlyOutput("regional_trends_plot", height = "500px"),
         card(
+          full_screen = TRUE,
+          card_header("Monthly Trends by Region"),
+          plotlyOutput("regional_trends_plot", height = "500px")
+        ),
+        card(
+          full_screen = TRUE,
           card_header("Regional Comparison Statistics"),
           DTOutput("regional_stats_table")
         )
@@ -199,6 +214,42 @@ ui <- page_navbar(
       card(
         card_header("National Year-over-Year Comparison"),
         plotOutput("ethiopia_yoy_plot", height = "300px")
+      )
+    )
+  ),
+  
+  # NEW: Spatial Distribution navigation panel
+  nav_panel(
+    title = "Spatial Distribution",
+    icon = bsicons::bs_icon("map"),
+    layout_sidebar(
+      sidebar = sidebar(
+        radioButtons(
+          "map_type",
+          "Map Type:",
+          choices = c(
+            "Total Malaria Cases" = "total_cases",
+            "Incidence per 1,000 (2023)" = "incidence_rate"
+          ),
+          selected = "total_cases"
+        ),
+        radioButtons(
+          "map_view",
+          "Map View:",
+          choices = c(
+            "Static Map" = "static",
+            "Interactive Map" = "interactive"
+          ),
+          selected = "interactive"
+        ),
+        hr(),
+        helpText("This spatial visualization shows the distribution of malaria cases across Ethiopian regions.")
+      ),
+      
+      card(
+        full_screen = TRUE,
+        card_header(textOutput("map_title")),
+        uiOutput("spatial_map_ui")
       )
     )
   )
@@ -444,103 +495,122 @@ server <- function(input, output, session) {
     )
   })
   
-  # Regional trends data preparation
-  regional_trends_data <- reactive({
-    data <- malaria_final_reg %>%
+  # Regional trends plot
+  output$regional_trends_plot <- renderPlotly({
+    # Filter data based on selected regions and year
+    filtered_data <- malaria_final_reg %>%
       filter(region_name %in% input$regions_to_compare)
     
-    # Apply year filter if selected
     if(input$year_filter != "All Years") {
-      data <- data %>% filter(year == input$year_filter)
+      filtered_data <- filtered_data %>%
+        filter(year == as.numeric(input$year_filter))
     }
     
-    # Apply normalization if requested
+    # Normalize if selected
     if(input$scale_type == "normalized") {
-      data <- data %>%
+      filtered_data <- filtered_data %>%
         group_by(region_name) %>%
-        mutate(normalized_cases = total_cases / max(total_cases) * 100) %>%
+        mutate(total_cases = total_cases / max(total_cases, na.rm = TRUE) * 100) %>%
         ungroup()
-    }
-    
-    data
-  })
-  
-  # Interactive monthly trends by region plot
-  output$regional_trends_plot <- renderPlotly({
-    data <- regional_trends_data()
-    
-    if(nrow(data) == 0) {
-      return(ggplot() + 
-               annotate("text", x = 0.5, y = 0.5, label = "No data available for the selected filters") +
-               theme_void())
-    }
-    
-    y_var <- if(input$scale_type == "normalized") "normalized_cases" else "total_cases"
-    y_label <- if(input$scale_type == "normalized") "Normalized Cases (%)" else "Total Cases"
-    
-    p <- data %>%
-      ggplot(aes(x = month, y = !!sym(y_var), color = region_name, group = interaction(region_name, year))) +
-      geom_line(size = 1) +
-      geom_point(size = 3) +
-      labs(
-        title = "Monthly Malaria Cases by Region",
-        subtitle = if(input$year_filter != "All Years") paste("Year:", input$year_filter) else "All Years",
-        x = "Month",
-        y = y_label,
-        color = "Region"
-      ) +
-      theme_minimal() +
-      theme(
-        legend.position = "bottom",
-        axis.text.x = element_text(angle = 45, hjust = 1)
-      )
-    
-    if(input$year_filter != "All Years") {
-      ggplotly(p) %>% layout(hovermode = "x unified")
+      
+      y_title <- "Normalized Cases (%)"
     } else {
-      # For all years, facet by year
-      p <- p + facet_wrap(~year, scales = "free_y")
-      ggplotly(p) %>% layout(hovermode = "x unified")
+      y_title <- "Number of Cases"
     }
+    
+    # Create plot
+    p <- plot_ly() 
+    
+    # Add a line for each region
+    for(region in unique(filtered_data$region_name)) {
+      region_data <- filtered_data %>% 
+        filter(region_name == region) %>%
+        arrange(date)
+      
+      p <- p %>% add_trace(
+        data = region_data,
+        x = ~date,
+        y = ~total_cases,
+        type = "scatter",
+        mode = "lines+markers",
+        name = region,
+        marker = list(size = 3)
+      )
+    }
+    
+    # Add layout
+    p %>% layout(
+      title = paste("Monthly Trends by Region", 
+                    ifelse(input$year_filter != "All Years", 
+                           paste("(", input$year_filter, ")", sep=""), "")),
+      xaxis = list(title = "Date"),
+      yaxis = list(title = y_title),
+      hovermode = "x unified",
+      legend = list(orientation = "h", y = -0.2)
+    )
   })
   
   # Regional comparison statistics table
   output$regional_stats_table <- renderDT({
-    data <- regional_trends_data() %>%
+    # Reuse the same filtering logic from the plot
+    filtered_data <- malaria_final_reg %>%
+      filter(region_name %in% input$regions_to_compare)
+    
+    if(input$year_filter != "All Years") {
+      filtered_data <- filtered_data %>%
+        filter(year == as.numeric(input$year_filter))
+    }
+    
+    # Calculate statistics
+    data <- filtered_data %>%
       group_by(region_name) %>%
       summarize(
         Total_Cases = sum(total_cases, na.rm = TRUE),
         Average_Monthly = round(mean(total_cases, na.rm = TRUE), 1),
-        Maximum_Month = month.name[which.max(tapply(total_cases, month, mean, na.rm = TRUE))],
-        Minimum_Month = month.name[which.min(tapply(total_cases, month, mean, na.rm = TRUE))],
-        Seasonality_Index = round(sd(tapply(total_cases, month, mean, na.rm = TRUE), na.rm = TRUE) / 
+        Maximum_Month = month.name[which.max(tapply(total_cases, match(month, month.name), mean, na.rm = TRUE))],
+        Minimum_Month = month.name[which.min(tapply(total_cases, match(month, month.name), mean, na.rm = TRUE))],
+        Seasonality_Index = round(sd(tapply(total_cases, match(month, month.name), mean, na.rm = TRUE), na.rm = TRUE) / 
                                     mean(total_cases, na.rm = TRUE), 2)
       ) %>%
       arrange(desc(Total_Cases))
     
+    # Handle the case when there's no data
+    if(nrow(data) == 0) {
+      return(datatable(
+        data.frame(Message = "No data available for the selected filters"),
+        options = list(dom = 't'),
+        rownames = FALSE
+      ))
+    }
+    
+    # Format the table
     datatable(
       data,
       options = list(
         pageLength = 10,
-        dom = 'lftip'
+        dom = 'lftip',
+        scrollX = TRUE
       ),
       rownames = FALSE,
-      caption = "Regional Comparison Statistics"
+      caption = paste("Regional Comparison Statistics", 
+                      if(input$year_filter != "All Years") paste("for", input$year_filter) else "for All Years")
     ) %>%
       formatStyle(
         'Seasonality_Index',
-        background = styleColorBar(c(0, max(data$Seasonality_Index)), '#d9f0d3'),
+        background = styleColorBar(c(0, max(data$Seasonality_Index, na.rm = TRUE)), '#d9f0d3'),
         backgroundSize = '100% 90%',
         backgroundRepeat = 'no-repeat',
         backgroundPosition = 'center'
       ) %>%
       formatStyle(
         'Total_Cases',
-        background = styleColorBar(c(0, max(data$Total_Cases)), '#f5b7b1'),
+        background = styleColorBar(c(0, max(data$Total_Cases, na.rm = TRUE)), '#f5b7b1'),
         backgroundSize = '100% 90%',
         backgroundRepeat = 'no-repeat',
         backgroundPosition = 'center'
-      )
+      ) %>%
+      formatCurrency('Total_Cases', currency = "", interval = 3, mark = ",", digits = 0) %>%
+      formatCurrency('Average_Monthly', currency = "", interval = 3, mark = ",", digits = 1)
   })
   
   # Reactive data for the distribution treemap
@@ -658,6 +728,182 @@ server <- function(input, output, session) {
            color = "Year") +
       theme_minimal() +
       theme(legend.position = "right")
+  })
+  
+  # NEW: Spatial visualization outputs
+  # Map title based on selection
+  output$map_title <- renderText({
+    if(input$map_type == "total_cases") {
+      "Spatial Distribution of Malaria Cases Across Ethiopian Regions"
+    } else {
+      "Malaria Incidence Rates Across Ethiopian Regions (2023)"
+    }
+  })
+  
+  # Spatial map UI output
+  output$spatial_map_ui <- renderUI({
+    if(input$map_view == "interactive") {
+      leafletOutput("interactive_map", height = "600px")
+    } else {
+      plotOutput("static_map", height = "600px")
+    }
+  })
+  
+  # Static map output
+  output$static_map <- renderPlot({
+    if(input$map_type == "total_cases") {
+      # Calculate centroids for labels
+      centroids <- st_centroid(merged_data)
+      
+      # Total cases map
+      ggplot(merged_data) +
+        geom_sf(aes(fill = total_cases), color = "white", size = 0.2, alpha = 0.9) +
+        geom_sf_text(data = centroids, 
+                     aes(label = region_name), 
+                     size = 3.5,
+                     color = "black", 
+                     fontface = "bold",
+                     check_overlap = TRUE) +
+        scale_fill_distiller(
+          palette = "YlOrRd",
+          direction = 1,
+          name = "Total Malaria Cases",
+          labels = scales::comma
+        ) +
+        labs(
+          title = "Spatial Variation of Malaria Cases Across Ethiopian Regions"
+        ) +
+        theme_void() +
+        theme(
+          plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+          plot.subtitle = element_text(size = 12, hjust = 0.5),
+          plot.caption = element_text(size = 10, hjust = 1),
+          legend.position = c(0.85, 0.85),
+          legend.justification = c(1, 1),
+          legend.title = element_text(size = 14),
+          legend.text = element_text(size = 12)
+        )
+    } else {
+      # Calculate centroids for incidence map
+      centroids <- st_centroid(merged_data2023)
+      
+      # Incidence rate map
+      ggplot(merged_data2023) +
+        geom_sf(aes(fill = incidence_per_1000), 
+                color = "gray40",
+                size = 0.2, 
+                alpha = 0.9) +
+        geom_sf_text(data = centroids,
+                     aes(label = paste0(region_name, "\n", round(incidence_per_1000, 1))),
+                     size = 3.2, color = "black", fontface = "bold") +
+        scale_fill_distiller(
+          palette = "YlOrRd",
+          direction = 1,
+          name = "Malaria Incidence\n(per 1,000 population)"
+        ) +
+        labs(
+          title = "Spatial Variation of Malaria Incidence Across Ethiopian Regions (2023)"
+        ) +
+        theme_void() +
+        theme(
+          plot.title = element_text(size = 16, face = "bold", hjust = 0.5, margin = margin(b = 5)),
+          plot.subtitle = element_text(size = 12, hjust = 0.5, margin = margin(b = 10)),
+          plot.caption = element_text(size = 9, hjust = 1, color = "gray40"),
+          legend.position = c(0.85, 0.85),
+          legend.justification = c(1, 1),
+          legend.title = element_text(size = 13),
+          legend.text = element_text(size = 11)
+        )
+    }
+  })
+  
+  # Interactive map output
+  output$interactive_map <- renderLeaflet({
+    if(input$map_type == "total_cases") {
+      # Color palette for total cases
+      pal <- colorNumeric(
+        palette = "YlOrRd",
+        domain = merged_data$total_cases
+      )
+      
+      # Create popup content for total cases
+      popup_content <- paste0(
+        "<strong>Region: </strong>", merged_data$region_name, "<br>",
+        "<strong>Total Cases: </strong>", scales::comma(merged_data$total_cases)
+      )
+      
+      # Create the interactive map for total cases
+      leaflet(merged_data) %>%
+        addProviderTiles(providers$CartoDB.Positron) %>%
+        addPolygons(
+          fillColor = ~pal(total_cases),
+          weight = 1,
+          opacity = 1,
+          color = "darkgray",
+          dashArray = "3",
+          fillOpacity = 0.7,
+          highlight = highlightOptions(
+            weight = 2,
+            color = "#667",
+            dashArray = "",
+            fillOpacity = 0.9,
+            bringToFront = TRUE
+          ),
+          popup = popup_content,
+          label = ~region_name
+        ) %>%
+        addLegend(
+          pal = pal,
+          values = ~total_cases,
+          opacity = 0.7,
+          title = "Total Malaria Cases",
+          position = "topright",
+          labFormat = labelFormat(big.mark = ",")
+        )
+    } else {
+      # Color palette for incidence rate
+      pal_inc <- colorNumeric(
+        palette = "YlOrRd",
+        domain = merged_data2023$incidence_per_1000
+      )
+      
+      # Create popup content for incidence rate
+      popup_content_inc <- paste0(
+        "<strong>Region: </strong>", merged_data2023$region_name, "<br>",
+        "<strong>Incidence per 1,000: </strong>", round(merged_data2023$incidence_per_1000, 2), "<br>"
+        # "<strong>Incidence per 1,000: </strong>", round(merged_data2023$incidence_per_1000, 2), "<br>",
+        # "<strong>Population: </strong>", scales::comma(merged_data2023$population), "<br>",
+        # "<strong>Cases (2023): </strong>", scales::comma(merged_data2023$total_cases_2023)
+      )
+      
+      # Create the interactive map for incidence rate
+      leaflet(merged_data2023) %>%
+        addProviderTiles(providers$CartoDB.Positron) %>%
+        addPolygons(
+          fillColor = ~pal_inc(incidence_per_1000),
+          weight = 1,
+          opacity = 1,
+          color = "darkgray",
+          dashArray = "3",
+          fillOpacity = 0.7,
+          highlight = highlightOptions(
+            weight = 2,
+            color = "#667",
+            dashArray = "",
+            fillOpacity = 0.9,
+            bringToFront = TRUE
+          ),
+          popup = popup_content_inc,
+          label = ~region_name
+        ) %>%
+        addLegend(
+          pal = pal_inc,
+          values = ~incidence_per_1000,
+          opacity = 0.7,
+          title = "Incidence per 1,000",
+          position = "topright"
+        )
+    }
   })
 }
 
